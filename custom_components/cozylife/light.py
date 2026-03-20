@@ -291,15 +291,23 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         self._attr_is_on = False
         self._attr_brightness = 0
         self._last_packed_scene = None
+        self._last_static_color_field = None
+        self._last_scene_payload = None
+        self._last_color_transport = "classic"
 
         # Per-instance copy to avoid mutating class-level set
         self._attr_supported_color_modes = set()
         model_name = self._tcp_client._device_model_name.lower()
+        self._has_static_color_field = 16 in tcp_client.dpid
         self._has_classic_color = 5 in tcp_client.dpid or 6 in tcp_client.dpid
         self._has_packed_color = 7 in tcp_client.dpid
-        self._prefer_packed_color = self._has_packed_color and (
-            not self._has_classic_color
-            or any(keyword in model_name for keyword in PACKED_COLOR_MODEL_KEYWORDS)
+        self._prefer_packed_color = (
+            not self._has_static_color_field
+            and self._has_packed_color
+            and (
+                not self._has_classic_color
+                or any(keyword in model_name for keyword in PACKED_COLOR_MODEL_KEYWORDS)
+            )
         )
 
         if 'switch' not in model_name:
@@ -311,9 +319,12 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             if 4 in tcp_client.dpid:
                 self._attr_supported_color_modes.add(ColorMode.BRIGHTNESS)
 
-            if self._has_classic_color or self._has_packed_color:
+            if self._has_classic_color or self._has_packed_color or self._has_static_color_field:
                 self._attr_color_mode = ColorMode.HS
                 self._attr_supported_color_modes.add(ColorMode.HS)
+
+            if self._has_static_color_field:
+                self._attr_supported_color_modes.add(ColorMode.COLOR_TEMP)
 
         # Only use ONOFF if the light supports no other color/brightness modes
         if not self._attr_supported_color_modes:
@@ -398,6 +409,90 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         }
 
     @staticmethod
+    def _sanitize_static_color_field(value: Any) -> str | None:
+        """Normalize a raw DPID 16 value into contiguous uppercase hex."""
+        if not isinstance(value, str):
+            return None
+        sanitized = "".join(char for char in value.upper() if char in "0123456789ABCDEF")
+        if len(sanitized) < 12:
+            return None
+        return sanitized[:12]
+
+    def _build_static_color_field_payload(
+        self,
+        hs_color: tuple[float, float],
+        brightness: int | None,
+    ) -> dict[str, Any]:
+        """Encode a static color for devices that use DPID 16 in manual mode."""
+        return {
+            "2": 0,
+            "4": self._protocol_brightness(brightness),
+            "16": (
+                self._packed_value(round(hs_color[0]))
+                + self._packed_value(round(hs_color[1] * 10))
+                + self._packed_value(None)
+            ),
+            "20": 0,
+        }
+
+    def _build_static_white_field_payload(
+        self,
+        color_temp_kelvin: int,
+        brightness: int | None,
+    ) -> dict[str, Any]:
+        """Encode a static white/color-temperature value for DPID 16."""
+        temp = max(
+            0,
+            min(
+                1000,
+                round(
+                    (color_temp_kelvin - self._attr_min_color_temp_kelvin)
+                    / self._kelvin_ratio
+                ),
+            ),
+        )
+        return {
+            "2": 0,
+            "4": self._protocol_brightness(brightness),
+            "16": self._packed_value(None) + self._packed_value(None) + self._packed_value(temp),
+            "20": 0,
+        }
+
+    def _apply_static_color_field_state(self, value: Any) -> bool:
+        """Update entity state from a DPID 16 static color/white payload."""
+        sanitized = self._sanitize_static_color_field(value)
+        if sanitized is None:
+            return False
+
+        self._last_static_color_field = sanitized
+        hue_hex = sanitized[0:4]
+        sat_hex = sanitized[4:8]
+        temp_hex = sanitized[8:12]
+
+        hue = None if hue_hex == "FFFF" else int(hue_hex, 16)
+        saturation = None if sat_hex == "FFFF" else int(sat_hex, 16)
+        temp = None if temp_hex == "FFFF" else int(temp_hex, 16)
+
+        if hue is not None and saturation is not None:
+            self._attr_color_mode = ColorMode.HS
+            self._attr_hs_color = (
+                float(max(0, min(360, hue))),
+                float(max(0, min(100, saturation / 10))),
+            )
+            self._last_color_transport = "field16"
+            return True
+
+        if temp is not None:
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+            self._attr_color_temp_kelvin = round(
+                self._attr_min_color_temp_kelvin + temp * self._kelvin_ratio
+            )
+            self._last_color_transport = "field16"
+            return True
+
+        return False
+
+    @staticmethod
     def _sanitize_packed_scene(scene: Any) -> str | None:
         """Normalize a raw DPID 7 string into contiguous uppercase hex."""
         if not isinstance(scene, str):
@@ -438,6 +533,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             "colors": colors,
             "raw": sanitized,
         }
+        self._last_scene_payload = sanitized
 
         first = colors[0]
         if first["hue"] is not None and first["saturation"] is not None:
@@ -446,6 +542,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                 float(max(0, min(360, first["hue"]))),
                 float(max(0, min(100, first["saturation"] / 10))),
             )
+            self._last_color_transport = "packed"
             return True
 
         if first["temp"] is not None:
@@ -453,6 +550,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             self._attr_color_temp_kelvin = round(
                 self._attr_min_color_temp_kelvin + first["temp"] * self._kelvin_ratio
             )
+            self._last_color_transport = "packed"
             return True
 
         return False
@@ -493,18 +591,31 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                 self._attr_brightness = int(self._state['4'] / 1000 * 255)
 
             parsed_packed_scene = False
-            if self._state.get('2') == 1 and '7' in self._state:
-                parsed_packed_scene = self._apply_packed_scene_state(self._state['7'])
+            if self._state.get('2') == 1:
+                if '18' in self._state:
+                    self._last_scene_payload = self._state['18']
+                    self._last_color_transport = "scene18"
+                if '19' in self._state:
+                    self._last_packed_scene = {
+                        "raw": self._state.get('18'),
+                        "speed": self._state['19'],
+                    }
+                if '7' in self._state:
+                    parsed_packed_scene = self._apply_packed_scene_state(self._state['7'])
 
             if self._state.get('2') == 0:
+                parsed_static_field = False
+                if '16' in self._state:
+                    parsed_static_field = self._apply_static_color_field_state(self._state['16'])
+
                 if '3' in self._state:
                     color_temp = self._state['3']
-                    if color_temp < 60000:
+                    if color_temp < 60000 and not parsed_static_field:
                         self._attr_color_mode = ColorMode.COLOR_TEMP
                         self._attr_color_temp_kelvin = round(
                             self._attr_min_color_temp_kelvin + self._state['3'] * self._kelvin_ratio)
 
-                if '5' in self._state:
+                if '5' in self._state and not parsed_static_field:
                     color = self._state['5']
                     saturation = self._state.get('6')
                     if color < 60000 and saturation is not None:
@@ -513,6 +624,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                             float(max(0, min(360, round(color)))),
                             float(max(0, min(100, round(saturation / 10)))),
                         )
+                        self._last_color_transport = "classic"
 
             if (
                 not parsed_packed_scene
@@ -565,7 +677,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         self.async_write_ha_state()
         payload = {'1': 255, '2': 0}
         count = 0
-        uses_packed_color = False
+        color_transport = "classic"
         if brightness is not None:
             self._effect = 'manual'
             payload['4'] = round(brightness / 255 * 1000)
@@ -576,7 +688,15 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             self._effect = 'manual'
             self._attr_color_mode = ColorMode.COLOR_TEMP
             self._attr_color_temp_kelvin = colortemp_kelvin
-            if self._prefer_packed_color and 3 not in self._tcp_client.dpid:
+            if self._has_static_color_field and 3 not in self._tcp_client.dpid:
+                payload.update(
+                    self._build_static_white_field_payload(
+                        colortemp_kelvin,
+                        brightness,
+                    )
+                )
+                color_transport = "field16"
+            elif self._prefer_packed_color and 3 not in self._tcp_client.dpid:
                 payload.update(
                     self._build_packed_white_payload(
                         colortemp_kelvin,
@@ -584,7 +704,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                         transition,
                     )
                 )
-                uses_packed_color = True
+                color_transport = "packed"
             else:
                 payload['3'] = round(
                     (colortemp_kelvin - self._attr_min_color_temp_kelvin) / self._kelvin_ratio)
@@ -594,7 +714,15 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             self._effect = 'manual'
             self._attr_color_mode = ColorMode.HS
             self._attr_hs_color = hs_color
-            if self._prefer_packed_color:
+            if self._has_static_color_field:
+                payload.update(
+                    self._build_static_color_field_payload(
+                        hs_color,
+                        brightness,
+                    )
+                )
+                color_transport = "field16"
+            elif self._prefer_packed_color:
                 payload.update(
                     self._build_packed_color_payload(
                         hs_color,
@@ -602,7 +730,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                         transition,
                     )
                 )
-                uses_packed_color = True
+                color_transport = "packed"
             else:
                 payload['5'] = round(hs_color[0])
                 payload['6'] = round(hs_color[1] * 10)
@@ -619,30 +747,66 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                     self._attr_color_mode = ColorMode.COLOR_TEMP
                     colortemp_kelvin = self.calc_color_temp_kelvin()
                     self._attr_color_temp_kelvin = colortemp_kelvin
-                    payload['3'] = round(
-                        (colortemp_kelvin - self._attr_min_color_temp_kelvin) / self._kelvin_ratio)
+                    if self._has_static_color_field and 3 not in self._tcp_client.dpid:
+                        payload.update(
+                            self._build_static_white_field_payload(
+                                colortemp_kelvin,
+                                brightness,
+                            )
+                        )
+                        color_transport = "field16"
+                    else:
+                        payload['3'] = round(
+                            (colortemp_kelvin - self._attr_min_color_temp_kelvin) / self._kelvin_ratio)
                     if self._transitioning !=0:
                         return None
                     if transition is None:
                         transition=5
             elif self._effect == 'sleep':
                     payload['4'] = 12
-                    payload['3'] = 0
                     self._attr_color_mode = ColorMode.COLOR_TEMP
                     self._attr_brightness = round(12 / 1000 * 255)
                     self._attr_color_temp_kelvin = self._attr_min_color_temp_kelvin
+                    if self._has_static_color_field and 3 not in self._tcp_client.dpid:
+                        payload.update(
+                            self._build_static_white_field_payload(
+                                self._attr_min_color_temp_kelvin,
+                                self._attr_brightness,
+                            )
+                        )
+                        color_transport = "field16"
+                    else:
+                        payload['3'] = 0
             elif self._effect == 'study':
                     payload['4'] = 1000
-                    payload['3'] = 1000
                     self._attr_color_mode = ColorMode.COLOR_TEMP
                     self._attr_brightness = 255
                     self._attr_color_temp_kelvin = self._attr_max_color_temp_kelvin
+                    if self._has_static_color_field and 3 not in self._tcp_client.dpid:
+                        payload.update(
+                            self._build_static_white_field_payload(
+                                self._attr_max_color_temp_kelvin,
+                                self._attr_brightness,
+                            )
+                        )
+                        color_transport = "field16"
+                    else:
+                        payload['3'] = 1000
             elif self._effect == 'warm':
                     payload['4'] = 1000
-                    payload['3'] = 0
                     self._attr_color_mode = ColorMode.COLOR_TEMP
                     self._attr_brightness = 255
                     self._attr_color_temp_kelvin = self._attr_min_color_temp_kelvin
+                    if self._has_static_color_field and 3 not in self._tcp_client.dpid:
+                        payload.update(
+                            self._build_static_white_field_payload(
+                                self._attr_min_color_temp_kelvin,
+                                self._attr_brightness,
+                            )
+                        )
+                        color_transport = "field16"
+                    else:
+                        payload['3'] = 0
             elif self._effect == 'chrismas':
                     payload['2'] = 1
                     payload['4'] = 1000
@@ -650,15 +814,16 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                     payload['7'] = '03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B403E8FFFF010E03E8FFFF002603E8FFFF'
 
         self._transitioning = 0
+        self._last_color_transport = color_transport
         _LOGGER.debug(
-            "CozyLife turn_on entity=%s packed=%s payload=%s kwargs=%s",
+            "CozyLife turn_on entity=%s transport=%s payload=%s kwargs=%s",
             getattr(self, "entity_id", self._unique_id),
-            uses_packed_color,
+            color_transport,
             payload,
             kwargs,
         )
 
-        if transition and not uses_packed_color:
+        if transition and color_transport == "classic":
             self._transitioning = time.time()
             now = self._transitioning
             if self._effect =='chrismas':
@@ -812,8 +977,15 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             'cozylife_pid': self._tcp_client._pid,
             'cozylife_model': self._tcp_client._device_model_name,
             'cozylife_dpid': list(self._tcp_client.dpid),
-            'cozylife_color_transport': 'packed' if self._prefer_packed_color else 'classic',
+            'cozylife_color_transport': self._last_color_transport,
+            'cozylife_preferred_transport': (
+                'field16' if self._has_static_color_field
+                else 'packed' if self._prefer_packed_color
+                else 'classic'
+            ),
+            'cozylife_last_static_color_field': self._last_static_color_field,
             'cozylife_last_packed_scene': self._last_packed_scene,
+            'cozylife_last_scene_payload': self._last_scene_payload,
             'cozylife_debug': self._tcp_client.debug_snapshot(),
         }
 
