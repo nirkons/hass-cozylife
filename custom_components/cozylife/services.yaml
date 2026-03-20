@@ -36,3 +36,10 @@ set_effect:
             - 'warm'
             - 'study'
             - 'chrismas'
+debug_dump:
+  name: Debug dump
+  description: Refresh a CozyLife light and log its raw protocol snapshot.
+  target:
+    entity:
+      integration: cozylife
+      domain: light

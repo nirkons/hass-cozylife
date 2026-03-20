@@ -2,7 +2,7 @@
 import json
 import socket
 import time
-from typing import Optional, Union, Any
+from typing import Union, Any
 import logging
 try:
   from .utils import get_pid_list, get_sn
@@ -49,6 +49,12 @@ class tcp_client(object):
     def __init__(self, ip, timeout=3):
         self._ip = ip
         self.timeout = timeout
+        self._last_command: dict[str, Any] | None = None
+        self._last_payload: dict[str, Any] | None = None
+        self._last_request: str | None = None
+        self._last_response: str | None = None
+        self._last_state: dict[str, Any] | None = None
+        self._last_error: str | None = None
 
     def disconnect(self):
         if self._connect:
@@ -67,8 +73,10 @@ class tcp_client(object):
             s.settimeout(self.timeout)
             s.connect((self._ip, self._port))
             self._connect = s
+            self._last_error = None
         except:
             _LOGGER.debug('Connection failed for ip=%s', self._ip)
+            self._last_error = f'connection failed to {self._ip}:{self._port}'
             self.disconnect()
 
     @property
@@ -112,9 +120,11 @@ class tcp_client(object):
                 self.disconnect()
                 self._initSocket()
                 return None
+            self._last_response = resp.decode('utf-8', errors='replace').strip()
             resp_json = json.loads(resp.strip())
         except:
             _LOGGER.debug('Failed to parse device info response')
+            self._last_error = 'failed to parse device info response'
             return None
 
         if resp_json.get('msg') is None or type(resp_json['msg']) is not dict:
@@ -146,6 +156,23 @@ class tcp_client(object):
 
         _LOGGER.debug('Device discovered: did=%s, pid=%s, type=%s',
                       self._device_id, self._pid, self._device_type_code)
+
+    def debug_snapshot(self) -> dict[str, Any]:
+        """Return the last known transport/debug state for this device."""
+        return {
+            "ip": self._ip,
+            "connected": self._connect is not None,
+            "did": getattr(self, "_device_id", None),
+            "pid": getattr(self, "_pid", None),
+            "model": getattr(self, "_device_model_name", None),
+            "dpid": list(getattr(self, "_dpid", []) or []),
+            "last_command": self._last_command,
+            "last_payload": self._last_payload,
+            "last_request": self._last_request,
+            "last_response": self._last_response,
+            "last_state": self._last_state,
+            "last_error": self._last_error,
+        }
 
     def _get_package(self, cmd: int, payload: dict) -> bytes:
         """
@@ -185,6 +212,19 @@ class tcp_client(object):
             raise Exception('CMD is not valid')
 
         payload_str = json.dumps(message, separators=(',', ':',))
+        self._last_command = {
+            "cmd": cmd,
+            "sn": self._sn,
+        }
+        self._last_payload = dict(payload)
+        self._last_request = payload_str
+        _LOGGER.debug(
+            "Sending CozyLife command ip=%s did=%s cmd=%s payload=%s",
+            self._ip,
+            getattr(self, "_device_id", None),
+            cmd,
+            payload,
+        )
         return bytes(payload_str + "\r\n", encoding='utf8')
 
     def _send_receiver(self, cmd: int, payload: dict) -> Union[dict, Any]:
@@ -208,6 +248,14 @@ class tcp_client(object):
             while i > 0:
                 res = self._connect.recv(1024)
                 i -= 1
+                self._last_response = res.decode('utf-8', errors='replace').strip()
+                _LOGGER.debug(
+                    "Received CozyLife payload ip=%s did=%s cmd=%s raw=%s",
+                    self._ip,
+                    getattr(self, "_device_id", None),
+                    cmd,
+                    self._last_response,
+                )
                 # only allow same sn
                 if self._sn in str(res):
                     payload = json.loads(res.strip())
@@ -220,12 +268,15 @@ class tcp_client(object):
                     if payload['msg'].get('data') is None or type(payload['msg']['data']) is not dict:
                         return None
 
+                    self._last_state = payload['msg']['data']
+                    self._last_error = None
                     return payload['msg']['data']
 
             return None
 
         except Exception as e:
             _LOGGER.debug('recv error: %s', e)
+            self._last_error = str(e)
             return None
 
     def _only_send(self, cmd: int, payload: dict) -> None:
@@ -238,12 +289,12 @@ class tcp_client(object):
         try:
             self._connect.send(self._get_package(cmd, payload))
         except:
-            self._connect.send(self._get_package(cmd, payload))
             try:
                 self.disconnect()
                 self._initSocket()
                 self._connect.send(self._get_package(cmd, payload))
             except:
+                self._last_error = f'failed to send command {cmd}'
                 self.disconnect()
 
     def control(self, payload: dict) -> bool:
@@ -260,4 +311,7 @@ class tcp_client(object):
         query device state
         :return:
         """
-        return self._send_receiver(CMD_QUERY, {})
+        state = self._send_receiver(CMD_QUERY, {})
+        if state is not None:
+            self._last_state = state
+        return state

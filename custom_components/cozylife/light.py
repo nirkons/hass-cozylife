@@ -6,7 +6,6 @@ from datetime import timedelta
 import time
 
 from homeassistant.helpers.restore_state import RestoreEntity
-from homeassistant.util import color as colorutil
 from homeassistant.components.light import (
     PLATFORM_SCHEMA,
     ATTR_BRIGHTNESS,
@@ -20,7 +19,7 @@ from homeassistant.components.light import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EFFECT
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_platform
@@ -28,16 +27,8 @@ from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from typing import Any
 from .const import (
     DOMAIN,
-    SWITCH_TYPE_CODE,
     LIGHT_TYPE_CODE,
     CONF_DEVICE_TYPE_CODE,
-    LIGHT_DPID,
-    SWITCH,
-    WORK_MODE,
-    TEMP,
-    BRIGHT,
-    HUE,
-    SAT,
     DEFAULT_MIN_KELVIN,
     DEFAULT_MAX_KELVIN,
 )
@@ -64,6 +55,20 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
 
 SCAN_INTERVAL = timedelta(seconds=60)
 MIN_INTERVAL=0.2
+PACKED_SCENE_COLORS = 7
+PACKED_STATIC_COLOR_OPERATOR = "08"
+PACKED_STATIC_WHITE_OPERATOR = "01"
+PACKED_DEFAULT_COLOR_SPEED = 500
+PACKED_DEFAULT_WHITE_SPEED = 1000
+PACKED_COLOR_MODEL_KEYWORDS = (
+    "strip",
+    "dream",
+    "rhythm",
+    "music",
+    "atmosphere",
+    "floor",
+    "bar",
+)
 
 CIRCADIAN_BRIGHTNESS = True
 try:
@@ -75,10 +80,12 @@ except:
 _LOGGER = logging.getLogger(__name__)
 
 SERVICE_SET_EFFECT = "set_effect"
+SERVICE_DEBUG_DUMP = "debug_dump"
 scenes = ['manual','natural','sleep','warm','study','chrismas']
 SERVICE_SCHEMA_SET_EFFECT = {
 vol.Required(CONF_EFFECT): vol.In([mode.lower() for mode in scenes])
 }
+SERVICE_SCHEMA_DEBUG_DUMP = {}
 
 
 async def async_setup_entry(
@@ -118,6 +125,9 @@ async def async_setup_entry(
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(
         SERVICE_SET_EFFECT, SERVICE_SCHEMA_SET_EFFECT, "async_set_effect"
+    )
+    platform.async_register_entity_service(
+        SERVICE_DEBUG_DUMP, SERVICE_SCHEMA_DEBUG_DUMP, "async_debug_dump"
     )
 
 
@@ -234,6 +244,16 @@ class CozyLifeSwitchAsLight(LightEntity):
 
         return None
 
+    async def async_debug_dump(self) -> None:
+        """Force a refresh and log the raw protocol snapshot for this device."""
+        await self.hass.async_add_executor_job(self._refresh_state)
+        _LOGGER.info(
+            "CozyLife debug dump for %s: %s",
+            getattr(self, "entity_id", self._unique_id),
+            self._tcp_client.debug_snapshot(),
+        )
+        self.async_write_ha_state()
+
 
 class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
     _attr_brightness: int | None = None
@@ -270,11 +290,19 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         self._transitioning = 0
         self._attr_is_on = False
         self._attr_brightness = 0
+        self._last_packed_scene = None
 
         # Per-instance copy to avoid mutating class-level set
         self._attr_supported_color_modes = set()
+        model_name = self._tcp_client._device_model_name.lower()
+        self._has_classic_color = 5 in tcp_client.dpid or 6 in tcp_client.dpid
+        self._has_packed_color = 7 in tcp_client.dpid
+        self._prefer_packed_color = self._has_packed_color and (
+            not self._has_classic_color
+            or any(keyword in model_name for keyword in PACKED_COLOR_MODEL_KEYWORDS)
+        )
 
-        if not 'switch' in self._tcp_client._device_model_name.lower():
+        if 'switch' not in model_name:
 
             if 3 in tcp_client.dpid:
                 self._attr_color_mode = ColorMode.COLOR_TEMP
@@ -283,7 +311,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             if 4 in tcp_client.dpid:
                 self._attr_supported_color_modes.add(ColorMode.BRIGHTNESS)
 
-            if 5 in tcp_client.dpid or 6 in tcp_client.dpid:
+            if self._has_classic_color or self._has_packed_color:
                 self._attr_color_mode = ColorMode.HS
                 self._attr_supported_color_modes.add(ColorMode.HS)
 
@@ -298,6 +326,146 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             self._attr_supported_color_modes.discard(ColorMode.BRIGHTNESS)
         if ColorMode.HS in self._attr_supported_color_modes and ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
             self._attr_supported_color_modes.discard(ColorMode.BRIGHTNESS)
+
+    def _packed_scene_speed(self, transition: float | None, default_speed: int) -> int:
+        """Map a HA transition to CozyLife's packed-scene speed scale."""
+        if transition is None:
+            return default_speed
+        return max(1, min(1000, round(transition * 100)))
+
+    def _protocol_brightness(self, brightness: int | None) -> int:
+        """Return CozyLife brightness on the 0-1000 protocol scale."""
+        if brightness is None:
+            brightness = self._attr_brightness or 255
+        return max(0, min(1000, round(brightness / 255 * 1000)))
+
+    @staticmethod
+    def _packed_value(value: int | None) -> str:
+        """Encode a 16-bit packed-scene field."""
+        if value is None:
+            return "FFFF"
+        return f"{max(0, min(0xFFFF, value)):04X}"
+
+    def _build_packed_scene(self, operator: str, chunks: list[str]) -> str:
+        """Return a padded packed-scene payload for DPID 7."""
+        padded = list(chunks[:PACKED_SCENE_COLORS])
+        while len(padded) < PACKED_SCENE_COLORS:
+            padded.append("000000000000")
+        return operator + "".join(padded)
+
+    def _build_packed_color_payload(
+        self,
+        hs_color: tuple[float, float],
+        brightness: int | None,
+        transition: float | None,
+    ) -> dict[str, Any]:
+        """Encode a static color for strip/bar devices that use DPID 7/8."""
+        chunk = (
+            self._packed_value(round(hs_color[0]))
+            + self._packed_value(round(hs_color[1] * 10))
+            + self._packed_value(None)
+        )
+        return {
+            "2": 1,
+            "4": self._protocol_brightness(brightness),
+            "7": self._build_packed_scene(PACKED_STATIC_COLOR_OPERATOR, [chunk]),
+            "8": self._packed_scene_speed(transition, PACKED_DEFAULT_COLOR_SPEED),
+        }
+
+    def _build_packed_white_payload(
+        self,
+        color_temp_kelvin: int,
+        brightness: int | None,
+        transition: float | None,
+    ) -> dict[str, Any]:
+        """Encode a static white/color-temperature scene for packed-color devices."""
+        temp = max(
+            0,
+            min(
+                1000,
+                round(
+                    (color_temp_kelvin - self._attr_min_color_temp_kelvin)
+                    / self._kelvin_ratio
+                ),
+            ),
+        )
+        chunk = self._packed_value(None) + self._packed_value(None) + self._packed_value(temp)
+        return {
+            "2": 1,
+            "4": self._protocol_brightness(brightness),
+            "7": self._build_packed_scene(PACKED_STATIC_WHITE_OPERATOR, [chunk, chunk]),
+            "8": self._packed_scene_speed(transition, PACKED_DEFAULT_WHITE_SPEED),
+        }
+
+    @staticmethod
+    def _sanitize_packed_scene(scene: Any) -> str | None:
+        """Normalize a raw DPID 7 string into contiguous uppercase hex."""
+        if not isinstance(scene, str):
+            return None
+        sanitized = "".join(char for char in scene.upper() if char in "0123456789ABCDEF")
+        if len(sanitized) < 14:
+            return None
+        return sanitized
+
+    def _apply_packed_scene_state(self, scene: Any) -> bool:
+        """Update entity state from a packed DPID 7 scene payload."""
+        sanitized = self._sanitize_packed_scene(scene)
+        if sanitized is None:
+            return False
+
+        colors = []
+        for index in range(2, len(sanitized), 12):
+            chunk = sanitized[index:index + 12]
+            if len(chunk) < 12 or chunk == "000000000000":
+                continue
+            hue_hex = chunk[0:4]
+            sat_hex = chunk[4:8]
+            temp_hex = chunk[8:12]
+            colors.append(
+                {
+                    "hue": None if hue_hex == "FFFF" else int(hue_hex, 16),
+                    "saturation": None if sat_hex == "FFFF" else int(sat_hex, 16),
+                    "temp": None if temp_hex == "FFFF" else int(temp_hex, 16),
+                    "raw": chunk,
+                }
+            )
+
+        if not colors:
+            return False
+
+        self._last_packed_scene = {
+            "operator": sanitized[:2],
+            "colors": colors,
+            "raw": sanitized,
+        }
+
+        first = colors[0]
+        if first["hue"] is not None and first["saturation"] is not None:
+            self._attr_color_mode = ColorMode.HS
+            self._attr_hs_color = (
+                float(max(0, min(360, first["hue"]))),
+                float(max(0, min(100, first["saturation"] / 10))),
+            )
+            return True
+
+        if first["temp"] is not None:
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+            self._attr_color_temp_kelvin = round(
+                self._attr_min_color_temp_kelvin + first["temp"] * self._kelvin_ratio
+            )
+            return True
+
+        return False
+
+    async def async_debug_dump(self) -> None:
+        """Force a refresh and log the raw protocol snapshot for this device."""
+        await self.hass.async_add_executor_job(self._refresh_state)
+        _LOGGER.info(
+            "CozyLife debug dump for %s: %s",
+            getattr(self, "entity_id", self._unique_id),
+            self._tcp_client.debug_snapshot(),
+        )
+        self.async_write_ha_state()
 
     async def async_set_effect(self, effect: str):
         """Set the effect regardless it is On or Off."""
@@ -321,27 +489,38 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         self._state = self._tcp_client.query()
         if self._state:
             self._attr_is_on = 0 < self._state['1']
+            if '4' in self._state:
+                self._attr_brightness = int(self._state['4'] / 1000 * 255)
 
-            if '2' in self._state:
-                if self._state['2'] == 0:
-                    if '3' in self._state:
-                        color_temp = self._state['3']
-                        if color_temp < 60000:
-                            self._attr_color_mode = ColorMode.COLOR_TEMP
-                            self._attr_color_temp_kelvin = round(
-                                self._attr_min_color_temp_kelvin + self._state['3'] * self._kelvin_ratio)
+            parsed_packed_scene = False
+            if self._state.get('2') == 1 and '7' in self._state:
+                parsed_packed_scene = self._apply_packed_scene_state(self._state['7'])
 
-                    if '4' in self._state:
-                        self._attr_brightness = int(self._state['4'] / 1000 * 255)
+            if self._state.get('2') == 0:
+                if '3' in self._state:
+                    color_temp = self._state['3']
+                    if color_temp < 60000:
+                        self._attr_color_mode = ColorMode.COLOR_TEMP
+                        self._attr_color_temp_kelvin = round(
+                            self._attr_min_color_temp_kelvin + self._state['3'] * self._kelvin_ratio)
 
-                    if '5' in self._state:
-                        color = self._state['5']
-                        if color < 60000:
-                            self._attr_color_mode = ColorMode.HS
-                            r, g, b = colorutil.color_hs_to_RGB(
-                                round(self._state['5']), round(self._state['6'] / 10))
-                            hs_color = colorutil.color_RGB_to_hs(r, g, b)
-                            self._attr_hs_color = hs_color
+                if '5' in self._state:
+                    color = self._state['5']
+                    saturation = self._state.get('6')
+                    if color < 60000 and saturation is not None:
+                        self._attr_color_mode = ColorMode.HS
+                        self._attr_hs_color = (
+                            float(max(0, min(360, round(color)))),
+                            float(max(0, min(100, round(saturation / 10)))),
+                        )
+
+            if (
+                not parsed_packed_scene
+                and self._prefer_packed_color
+                and '7' in self._state
+                and self._state.get('2') != 0
+            ):
+                self._apply_packed_scene_state(self._state['7'])
 
     async def async_update(self):
         """Poll device state. Handle natural effect on update cycle."""
@@ -386,6 +565,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
         self.async_write_ha_state()
         payload = {'1': 255, '2': 0}
         count = 0
+        uses_packed_color = False
         if brightness is not None:
             self._effect = 'manual'
             payload['4'] = round(brightness / 255 * 1000)
@@ -396,18 +576,36 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             self._effect = 'manual'
             self._attr_color_mode = ColorMode.COLOR_TEMP
             self._attr_color_temp_kelvin = colortemp_kelvin
-            payload['3'] = round(
-                (colortemp_kelvin - self._attr_min_color_temp_kelvin) / self._kelvin_ratio)
+            if self._prefer_packed_color and 3 not in self._tcp_client.dpid:
+                payload.update(
+                    self._build_packed_white_payload(
+                        colortemp_kelvin,
+                        brightness,
+                        transition,
+                    )
+                )
+                uses_packed_color = True
+            else:
+                payload['3'] = round(
+                    (colortemp_kelvin - self._attr_min_color_temp_kelvin) / self._kelvin_ratio)
             count += 1
 
         if hs_color is not None:
             self._effect = 'manual'
             self._attr_color_mode = ColorMode.HS
             self._attr_hs_color = hs_color
-            r, g, b = colorutil.color_hs_to_RGB(*hs_color)
-            hs_color = colorutil.color_RGB_to_hs(r, g, b)
-            payload['5'] = round(hs_color[0])
-            payload['6'] = round(hs_color[1] * 10)
+            if self._prefer_packed_color:
+                payload.update(
+                    self._build_packed_color_payload(
+                        hs_color,
+                        brightness,
+                        transition,
+                    )
+                )
+                uses_packed_color = True
+            else:
+                payload['5'] = round(hs_color[0])
+                payload['6'] = round(hs_color[1] * 10)
             count += 1
 
         if count == 0:
@@ -452,18 +650,25 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                     payload['7'] = '03000003E8FFFF007803E8FFFF00F003E8FFFF003C03E8FFFF00B403E8FFFF010E03E8FFFF002603E8FFFF'
 
         self._transitioning = 0
+        _LOGGER.debug(
+            "CozyLife turn_on entity=%s packed=%s payload=%s kwargs=%s",
+            getattr(self, "entity_id", self._unique_id),
+            uses_packed_color,
+            payload,
+            kwargs,
+        )
 
-        if transition:
+        if transition and not uses_packed_color:
             self._transitioning = time.time()
             now = self._transitioning
             if self._effect =='chrismas':
                 await self.hass.async_add_executor_job(self._tcp_client.control, payload)
                 self._transitioning = 0
                 return None
-            if brightness:
-                payloadtemp = {'1': 255, '2': 0}
-                p4i = round(originalbrightness / 255 * 1000)
-                p4f = payload['4']
+            payloadtemp = {'1': 255, '2': 0}
+            p4i = round(originalbrightness / 255 * 1000)
+            p4f = payload.get('4', p4i)
+            if '4' in payload:
                 p4steps = abs(round((p4i-p4f)/4))
             else:
                 p4steps = 0
@@ -480,7 +685,7 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                 stepseconds = transition / steps
                 if stepseconds < MIN_INTERVAL:
                     stepseconds = MIN_INTERVAL
-                    steps = round(transition / stepseconds)
+                    steps = max(1, round(transition / stepseconds))
                     stepseconds = transition / steps
                 for s in range(1,steps+1):
                     payloadtemp['4']= round(p4i + (p4f - p4i) * s / steps)
@@ -509,17 +714,19 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
                     self._transitioning = 0
                     return None
                 stepseconds = transition / steps
-                if stepseconds < 4:
-                    steps = round(transition / stepseconds)
+                if stepseconds < MIN_INTERVAL:
+                    stepseconds = MIN_INTERVAL
+                    steps = max(1, round(transition / stepseconds))
                     stepseconds = transition / steps
-                for s in range(steps):
+                for s in range(1, steps + 1):
                     payloadtemp['4']= round(p4i + (p4f - p4i) * s / steps)
                     if p5steps != 0:
                         payloadtemp['5']= round(p5i + (p5f - p5i) * s / steps)
                         payloadtemp['6']= round(p6i + (p6f - p6i) * s / steps)
                     if now == self._transitioning:
                         await self.hass.async_add_executor_job(self._tcp_client.control, payloadtemp)
-                        await asyncio.sleep(stepseconds)
+                        if s < steps:
+                            await asyncio.sleep(stepseconds)
                     else:
                         self._transitioning = 0
                         return None
@@ -551,9 +758,9 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
             stepseconds = transition / steps
             if stepseconds < MIN_INTERVAL:
                 stepseconds = MIN_INTERVAL
-                steps = round(transition / stepseconds)
+                steps = max(1, round(transition / stepseconds))
                 stepseconds = transition / steps
-            for s in range(1+steps+1):
+            for s in range(1, steps + 1):
                 payloadtemp['4']= round(p4i + (p4f - p4i) * s / steps)
                 if now == self._transitioning:
                     await self.hass.async_add_executor_job(self._tcp_client.control, payloadtemp)
@@ -599,11 +806,16 @@ class CozyLifeLight(CozyLifeSwitchAsLight,RestoreEntity):
 
     @property
     def extra_state_attributes(self):
-        attributes = {}
-        attributes['last_effect'] = self._effect
-        attributes['transitioning'] = self._transitioning
-
-        return attributes
+        return {
+            'last_effect': self._effect,
+            'transitioning': self._transitioning,
+            'cozylife_pid': self._tcp_client._pid,
+            'cozylife_model': self._tcp_client._device_model_name,
+            'cozylife_dpid': list(self._tcp_client.dpid),
+            'cozylife_color_transport': 'packed' if self._prefer_packed_color else 'classic',
+            'cozylife_last_packed_scene': self._last_packed_scene,
+            'cozylife_debug': self._tcp_client.debug_snapshot(),
+        }
 
     @property
     def supported_features(self) -> LightEntityFeature:
